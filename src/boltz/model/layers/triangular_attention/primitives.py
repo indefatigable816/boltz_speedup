@@ -17,6 +17,7 @@ import math
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
@@ -172,28 +173,27 @@ def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return s
 
 
-# @torch.jit.script
 def _attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     biases: List[torch.Tensor],
 ) -> torch.Tensor:
-    # [*, H, C_hidden, K]
-    key = permute_final_dims(key, (1, 0))
+    """Attention using PyTorch SDPA (Flash / memory-efficient backend on CUDA).
 
-    # [*, H, Q, K]
-    a = torch.matmul(query, key)
+    query/key/value are [*, H, Q/K, C_hidden] and already scaled by
+    1/sqrt(C_hidden) from _prep_qkv(apply_scale=True), so we pass scale=1.0
+    to avoid double-scaling.
+    """
+    attn_mask: Optional[torch.Tensor] = None
+    if biases:
+        attn_mask = biases[0]
+        for b in biases[1:]:
+            attn_mask = attn_mask + b
 
-    for b in biases:
-        a += b
-
-    a = softmax_no_cast(a, -1)
-
-    # [*, H, Q, C_hidden]
-    a = torch.matmul(a, value)
-
-    return a
+    return F.scaled_dot_product_attention(
+        query, key, value, attn_mask=attn_mask, scale=1.0
+    )
 
 
 @torch.compiler.disable

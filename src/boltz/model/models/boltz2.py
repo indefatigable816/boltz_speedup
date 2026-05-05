@@ -436,6 +436,17 @@ class Boltz2(LightningModule):
             mask = feats["token_pad_mask"].float()
             pair_mask = mask[:, :, None] * mask[:, None, :]
             if self.run_trunk_and_structure:
+                # Early recycling exit state (inference only, gated by predict_args)
+                _early_exit = (
+                    not self.training
+                    and isinstance(self.predict_args, dict)
+                    and self.predict_args.get("early_recycling_exit", False)
+                )
+                _CONV_THRESH = 0.01   # relative Frobenius norm change threshold
+                _CONV_PATIENCE = 2    # consecutive steps below threshold to exit
+                _z_prev = None
+                _converged_count = 0
+
                 for i in range(recycling_steps + 1):
                     with torch.set_grad_enabled(
                         self.training
@@ -487,6 +498,18 @@ class Boltz2(LightningModule):
                             pair_mask=pair_mask,
                             use_kernels=self.use_kernels,
                         )
+
+                        # Early recycling exit: check z-embedding convergence
+                        if _early_exit and i > 0 and _z_prev is not None:
+                            _z_det = z.detach().float()
+                            _delta = (_z_det - _z_prev).norm() / (_z_prev.norm() + 1e-8)
+                            if _delta.item() < _CONV_THRESH:
+                                _converged_count += 1
+                                if _converged_count >= _CONV_PATIENCE:
+                                    break
+                            else:
+                                _converged_count = 0
+                        _z_prev = z.detach().float() if _early_exit else None
 
             pdistogram = self.distogram_module(z)
             dict_out = {

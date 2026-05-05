@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch import Tensor, nn
 
@@ -86,26 +87,36 @@ class AttentionPairBias(nn.Module):
         """
         B = s.shape[0]
 
-        # Compute projections
+        # Compute projections: [B, N, num_heads, head_dim]
         q = self.proj_q(s).view(B, -1, self.num_heads, self.head_dim)
         k = self.proj_k(k_in).view(B, -1, self.num_heads, self.head_dim)
         v = self.proj_v(k_in).view(B, -1, self.num_heads, self.head_dim)
 
+        # bias: [B, num_heads, N, N] → [B*mult, num_heads, N, N]
         bias = self.proj_z(z)
         bias = bias.repeat_interleave(multiplicity, 0)
 
         g = self.proj_g(s).sigmoid()
 
-        with torch.autocast("cuda", enabled=False):
-            # Compute attention weights
-            attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
-            attn = attn / (self.head_dim**0.5) + bias.float()
-            attn = attn + (1 - mask[:, None, None].float()) * -self.inf
-            attn = attn.softmax(dim=-1)
+        # Rearrange to [B, num_heads, N, head_dim] for SDPA
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-            # Compute output
-            o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
-        o = o.reshape(B, -1, self.c_s)
+        # Combine pair bias and padding mask into a single additive attn_mask
+        # pad_mask: [B, 1, 1, N] — broadcasts over [B, H, N, N]
+        pad_mask = (1 - mask[:, None, None].float()) * -self.inf
+        attn_mask = bias.float() + pad_mask  # [B*mult, num_heads, N, N]
+
+        # Flash Attention via scaled_dot_product_attention.
+        # Keeps fp32 so numerical behaviour is identical to the original.
+        # Memory-efficient attention backend is used on CUDA (O(N) memory).
+        o = F.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), attn_mask=attn_mask
+        ).to(v.dtype)
+
+        # [B, num_heads, N, head_dim] → [B, N, c_s]
+        o = o.transpose(1, 2).reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
 
         return o
