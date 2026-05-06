@@ -1154,8 +1154,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         compile_confidence = True
         early_recycling_exit = True
         subsample_msa = True
-        if num_subsampled_msa > 512:
-            num_subsampled_msa = 512
+        if num_subsampled_msa > 4096:
+            num_subsampled_msa = 4096
         if sampling_steps == 200:          # only override if user left the default
             sampling_steps = 50
         if recycling_steps == 3:           # only override if user left the default
