@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from einops.layers.torch import Rearrange
 from torch import Tensor, nn
 
@@ -117,15 +118,23 @@ class AttentionPairBias(nn.Module):
         g = self.proj_g(s).sigmoid()
 
         with torch.autocast("cuda", enabled=False):
-            # Compute attention weights
-            attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
-            attn = attn / (self.head_dim**0.5) + z.float()
-            # The pairwise mask tensor (B, N) is broadcasted to (B, 1, 1, N) and (B, H, N, N)
-            attn = attn + (1 - mask[:, None, None].float()) * -self.inf
-            attn = attn.softmax(dim=-1)
-
-            # Compute output
-            o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
+            if q.is_cuda:
+                # CUDA path: fused SDPA (Flash / memory-efficient attention)
+                q_t = q.transpose(1, 2).float()
+                k_t = k.transpose(1, 2).float()
+                v_t = v.transpose(1, 2).float()
+                attn_bias = z.float() + (1 - mask[:, None, None].float()) * -self.inf
+                o = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t, attn_mask=attn_bias,
+                ).to(v.dtype)
+                o = o.transpose(1, 2)  # [B, N, num_heads, head_dim]
+            else:
+                # CPU / MPS path: original einsum for bit-exact reproducibility
+                attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
+                attn = attn / (self.head_dim**0.5) + z.float()
+                attn = attn + (1 - mask[:, None, None].float()) * -self.inf
+                attn = attn.softmax(dim=-1)
+                o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
         o = o.reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
 

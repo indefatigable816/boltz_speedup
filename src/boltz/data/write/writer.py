@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
@@ -24,6 +25,7 @@ class BoltzWriter(BasePredictionWriter):
         output_format: Literal["pdb", "mmcif"] = "mmcif",
         boltz2: bool = False,
         write_embeddings: bool = False,
+        compress_output: bool = True,
     ) -> None:
         """Initialize the writer.
 
@@ -31,6 +33,9 @@ class BoltzWriter(BasePredictionWriter):
         ----------
         output_dir : str
             The directory to save the predictions.
+        compress_output : bool
+            Whether to use np.savez_compressed (True) or np.savez (False).
+            Uncompressed writes are ~3× faster at the cost of larger files.
 
         """
         super().__init__(write_interval="batch")
@@ -45,6 +50,22 @@ class BoltzWriter(BasePredictionWriter):
         self.boltz2 = boltz2
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.write_embeddings = write_embeddings
+        self._savez = np.savez_compressed if compress_output else np.savez
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._futures: list = []
+
+    # ------------------------------------------------------------------
+    # Async write helpers — overlap GPU compute with disk I/O
+    # ------------------------------------------------------------------
+    def _submit_write(self, fn, *args, **kwargs):
+        """Submit a write task to the background thread pool."""
+        self._futures.append(self._executor.submit(fn, *args, **kwargs))
+
+    def _flush_writes(self):
+        """Wait for all pending writes to complete."""
+        for future in self._futures:
+            future.result()
+        self._futures.clear()
 
     def write_on_batch_end(
         self,
@@ -161,23 +182,19 @@ class BoltzWriter(BasePredictionWriter):
                 # Save the structure
                 if self.output_format == "pdb":
                     path = struct_dir / f"{outname}.pdb"
-                    with path.open("w") as f:
-                        f.write(
-                            to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
-                        )
+                    content = to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
+                    self._submit_write(path.write_text, content)
                 elif self.output_format == "mmcif":
                     path = struct_dir / f"{outname}.cif"
-                    with path.open("w") as f:
-                        f.write(
-                            to_mmcif(new_structure, plddts=plddts, boltz2=self.boltz2)
-                        )
+                    content = to_mmcif(new_structure, plddts=plddts, boltz2=self.boltz2)
+                    self._submit_write(path.write_text, content)
                 else:
                     path = struct_dir / f"{outname}.npz"
-                    np.savez_compressed(path, **asdict(new_structure))
+                    self._submit_write(self._savez, path, **asdict(new_structure))
 
                 if self.boltz2 and record.affinity and idx_to_rank[model_idx] == 0:
                     path = struct_dir / f"pre_affinity_{record.id}.npz"
-                    np.savez_compressed(path, **asdict(new_structure))
+                    self._submit_write(self._savez, path, **asdict(new_structure))
                     np.array(atoms["coords"][:, None], dtype=Coords)
 
                 # Save confidence summary
@@ -212,13 +229,10 @@ class BoltzWriter(BasePredictionWriter):
                         }
                         for idx1 in prediction["pair_chains_iptm"]
                     }
-                    with path.open("w") as f:
-                        f.write(
-                            json.dumps(
-                                confidence_summary_dict,
-                                indent=4,
-                            )
-                        )
+                    self._submit_write(
+                        path.write_text,
+                        json.dumps(confidence_summary_dict, indent=4),
+                    )
 
                     # Save plddt
                     plddt = prediction["plddt"][model_idx]
@@ -226,7 +240,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, plddt=plddt.cpu().numpy())
+                    self._submit_write(self._savez, path, plddt=plddt.cpu().numpy())
 
                 # Save pae
                 if "pae" in prediction:
@@ -235,7 +249,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pae=pae.cpu().numpy())
+                    self._submit_write(self._savez, path, pae=pae.cpu().numpy())
 
                 # Save pde
                 if "pde" in prediction:
@@ -244,7 +258,7 @@ class BoltzWriter(BasePredictionWriter):
                         struct_dir
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
-                    np.savez_compressed(path, pde=pde.cpu().numpy())
+                    self._submit_write(self._savez, path, pde=pde.cpu().numpy())
                 
             # Save embeddings
             if self.write_embeddings and "s" in prediction and "z" in prediction:
@@ -255,15 +269,16 @@ class BoltzWriter(BasePredictionWriter):
                     struct_dir
                     / f"embeddings_{record.id}.npz"
                 )
-                np.savez_compressed(path, s=s, z=z)
+                self._submit_write(self._savez, path, s=s, z=z)
 
     def on_predict_epoch_end(
         self,
         trainer: Trainer,  # noqa: ARG002
         pl_module: LightningModule,  # noqa: ARG002
     ) -> None:
-        """Print the number of failed examples."""
-        # Print number of failed examples
+        """Flush pending writes and print failure count."""
+        self._flush_writes()
+        self._executor.shutdown(wait=True)
         print(f"Number of failed examples: {self.failed}")  # noqa: T201
 
 

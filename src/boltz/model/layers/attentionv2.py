@@ -19,20 +19,6 @@ class AttentionPairBias(nn.Module):
         inf: float = 1e6,
         compute_pair_bias: bool = True,
     ) -> None:
-        """Initialize the attention pair bias layer.
-
-        Parameters
-        ----------
-        c_s : int
-            The input sequence dimension.
-        c_z : int
-            The input pairwise dimension.
-        num_heads : int
-            The number of heads.
-        inf : float, optional
-            The inf value, by default 1e6
-
-        """
         super().__init__()
 
         assert c_s % num_heads == 0
@@ -68,23 +54,7 @@ class AttentionPairBias(nn.Module):
         k_in: Tensor,
         multiplicity: int = 1,
     ) -> Tensor:
-        """Forward pass.
-
-        Parameters
-        ----------
-        s : torch.Tensor
-            The input sequence tensor (B, S, D)
-        z : torch.Tensor
-            The input pairwise tensor or bias (B, N, N, D)
-        mask : torch.Tensor
-            The pairwise mask tensor (B, N, N)
-
-        Returns
-        -------
-        torch.Tensor
-            The output sequence tensor.
-
-        """
+        """Forward pass."""
         B = s.shape[0]
 
         # Compute projections: [B, N, num_heads, head_dim]
@@ -98,25 +68,26 @@ class AttentionPairBias(nn.Module):
 
         g = self.proj_g(s).sigmoid()
 
-        # Rearrange to [B, num_heads, N, head_dim] for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        with torch.autocast("cuda", enabled=False):
+            if q.is_cuda:
+                # CUDA path: fused SDPA (Flash / memory-efficient attention)
+                # Rearrange to [B, num_heads, N, head_dim] for SDPA
+                q_t = q.transpose(1, 2).float()
+                k_t = k.transpose(1, 2).float()
+                v_t = v.transpose(1, 2).float()
+                attn_bias = bias.float() + (1 - mask[:, None, None].float()) * -self.inf
+                o = F.scaled_dot_product_attention(
+                    q_t, k_t, v_t, attn_mask=attn_bias,
+                ).to(v.dtype)
+                o = o.transpose(1, 2)  # [B, N, num_heads, head_dim]
+            else:
+                # CPU / MPS path: original einsum for bit-exact reproducibility
+                attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
+                attn = attn / (self.head_dim ** 0.5) + bias.float()
+                attn = attn + (1 - mask[:, None, None].float()) * -self.inf
+                attn = attn.softmax(dim=-1)
+                o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
 
-        # Combine pair bias and padding mask into a single additive attn_mask
-        # pad_mask: [B, 1, 1, N] — broadcasts over [B, H, N, N]
-        pad_mask = (1 - mask[:, None, None].float()) * -self.inf
-        attn_mask = bias.float() + pad_mask  # [B*mult, num_heads, N, N]
-
-        # Flash Attention via scaled_dot_product_attention.
-        # Keeps fp32 so numerical behaviour is identical to the original.
-        # Memory-efficient attention backend is used on CUDA (O(N) memory).
-        o = F.scaled_dot_product_attention(
-            q.float(), k.float(), v.float(), attn_mask=attn_mask
-        ).to(v.dtype)
-
-        # [B, num_heads, N, head_dim] → [B, N, c_s]
-        o = o.transpose(1, 2).reshape(B, -1, self.c_s)
+        o = o.reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
-
         return o

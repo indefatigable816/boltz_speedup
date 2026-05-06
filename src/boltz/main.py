@@ -1,4 +1,5 @@
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pickle
 import platform
@@ -466,24 +467,10 @@ def compute_msa(
     else:
         click.echo("No authentication provided for MSA server")
     
-    if len(data) > 1:
-        paired_msas = run_mmseqs2(
-            list(data.values()),
-            msa_dir / f"{target_id}_paired_tmp",
-            use_env=True,
-            use_pairing=True,
-            host_url=msa_server_url,
-            pairing_strategy=msa_pairing_strategy,
-            msa_server_username=msa_server_username,
-            msa_server_password=msa_server_password,
-            auth_headers=auth_headers,
-        )
-    else:
-        paired_msas = [""] * len(data)
-
-    unpaired_msa = run_mmseqs2(
-        list(data.values()),
-        msa_dir / f"{target_id}_unpaired_tmp",
+    sequences = list(data.values())
+    unpaired_kwargs = dict(
+        x=sequences,
+        prefix=msa_dir / f"{target_id}_unpaired_tmp",
         use_env=True,
         use_pairing=False,
         host_url=msa_server_url,
@@ -492,6 +479,28 @@ def compute_msa(
         msa_server_password=msa_server_password,
         auth_headers=auth_headers,
     )
+
+    if len(data) > 1:
+        paired_kwargs = dict(
+            x=sequences,
+            prefix=msa_dir / f"{target_id}_paired_tmp",
+            use_env=True,
+            use_pairing=True,
+            host_url=msa_server_url,
+            pairing_strategy=msa_pairing_strategy,
+            msa_server_username=msa_server_username,
+            msa_server_password=msa_server_password,
+            auth_headers=auth_headers,
+        )
+        # Run paired and unpaired MSA searches concurrently
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            paired_future = executor.submit(run_mmseqs2, **paired_kwargs)
+            unpaired_future = executor.submit(run_mmseqs2, **unpaired_kwargs)
+            paired_msas = paired_future.result()
+            unpaired_msa = unpaired_future.result()
+    else:
+        paired_msas = [""] * len(data)
+        unpaired_msa = run_mmseqs2(**unpaired_kwargs)
 
     for idx, name in enumerate(data):
         # Get paired sequences
@@ -1076,6 +1085,14 @@ def cli() -> None:
         "subsample_msa, compile all modules, TORCHINDUCTOR cache."
     ),
 )
+@click.option(
+    "--no_compress",
+    is_flag=True,
+    help=(
+        "Disable npz compression for output files. "
+        "Faster writes (~3-5x) at the cost of ~10%% larger files on disk."
+    ),
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1120,6 +1137,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     compile_confidence: bool = False,
     early_recycling_exit: bool = False,
     screening_mode: bool = False,
+    no_compress: bool = False,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1316,6 +1334,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_format=output_format,
         boltz2=model == "boltz2",
         write_embeddings=write_embeddings,
+        compress_output=not no_compress,
     )
 
     # Set up trainer
