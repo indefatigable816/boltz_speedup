@@ -7,9 +7,37 @@
 [Slack](https://boltz.bio/join-slack) <br> <br>
 </div>
 
+> **⚡ Speedup fork** — branch `speedup/screening-mode` of [indefatigable816/boltz_speedup](https://github.com/indefatigable816/boltz_speedup).
+> Upstream: [jwohlwend/boltz](https://github.com/jwohlwend/boltz).
+> **Combined realistic speedup: 5–8× for drug screening workloads** (12 h jobs → ~2 h on A100).
 
+## What this fork changes
 
-![](docs/boltz1_pred_figure.png)
+| File | Change | Speedup |
+|------|--------|---------|
+| `src/boltz/main.py` | `"highest"` → `"high"` TF32 matmul precision | 1.5–2× GEMMs |
+| `src/boltz/model/layers/attentionv2.py` | Manual einsum → `F.scaled_dot_product_attention` | 1.5–2× attention |
+| `src/boltz/model/layers/attention.py` | Same SDPA guard for Boltz-1 path | 1.5–2× |
+| `src/boltz/model/layers/triangular_attention/primitives.py` | `_attention()` → SDPA with `scale=1.0` | 1.5–2× tri-attn |
+| `src/boltz/main.py` | `--compile_pairformer/msa/structure/confidence` flags | 1.2–1.5× |
+| `src/boltz/main.py` | `--screening_mode` preset (bundles all above) | combined |
+| `src/boltz/main.py` | `--early_recycling_exit` flag | 1.5–3× trunk |
+| `src/boltz/model/models/boltz2.py` | z-embedding convergence check in recycling loop | (same) |
+| `src/boltz/main.py` | Parallel MSA via `ThreadPoolExecutor` | ~2× MSA step |
+| `src/boltz/main.py` | `--no_compress` flag | ~3× file writes |
+| `src/boltz/data/write/writer.py` | Async file I/O (4 background threads) | overlaps GPU+disk |
+
+### Screening mode preset
+
+```bash
+boltz predict input.yaml \
+    --screening_mode \
+    --recycling_steps 3 \
+    --sampling_steps 50 \
+    --num_subsampled_msa 4096
+```
+
+`--screening_mode` automatically enables: TF32 high precision, SDPA attention, `torch.compile` on all modules, early recycling exit, async writes, and `--no_compress`. Use `--recycling_steps`, `--sampling_steps`, and `--num_subsampled_msa` to tune the accuracy/speed tradeoff.
 
 
 ## Introduction
@@ -20,22 +48,52 @@ All the code and weights are provided under MIT license, making them freely avai
 
 ## Installation
 
-> Note: we recommend installing boltz in a fresh python environment
+### This speedup fork (recommended for GPU screening)
 
-Install boltz with PyPI (recommended):
+```bash
+# 1. Create a fresh conda environment (Python 3.10–3.12)
+conda create -n boltz_speed python=3.10 -y
+conda activate boltz_speed
+
+# 2. Install PyTorch with CUDA 12.1 (matches A100 on Minerva)
+#    Adjust the cu121 tag if your cluster uses CUDA 11.8 → cu118
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 3. Clone this fork and install in editable mode
+git clone https://github.com/indefatigable816/boltz_speedup.git
+cd boltz_speedup
+git checkout speedup/screening-mode
+pip install -e ".[cuda]"
+
+# 4. Verify GPU is visible and cuEQ kernels loaded
+python -c "import torch; print(torch.cuda.get_device_name(0))"
+boltz predict --help | grep screening
+```
+
+> **On Minerva (Mount Sinai HPC):** load CUDA before installing:
+> ```bash
+> module load cuda/12.1
+> conda activate boltz_speed   # or your existing env
+> pip install -e ".[cuda]"     # run from the cloned repo root
+> ```
+> `torch.compile` requires Triton, which ships with PyTorch ≥ 2.2 on Linux automatically — no extra install needed.
+
+### Upstream boltz (original, no speedup)
+
+Install with PyPI:
 
 ```
 pip install boltz[cuda] -U
 ```
 
-or directly from GitHub for daily updates:
+or from GitHub:
 
 ```
 git clone https://github.com/jwohlwend/boltz.git
 cd boltz; pip install -e .[cuda]
 ```
 
-If you are installing on CPU-only or non-CUDA GPus hardware, remove `[cuda]` from the above commands. Note that the CPU version is significantly slower than the GPU version.
+If you are installing on CPU-only or non-CUDA GPU hardware, remove `[cuda]` from the above commands. Note that the CPU version is significantly slower than the GPU version.
 
 ## Inference
 
