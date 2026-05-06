@@ -58,37 +58,6 @@ pip install "boltz-speed[cuda] @ git+https://github.com/indefatigable816/boltz_s
 
 This installs as `boltz-speed` and exposes two CLI commands: `boltz` and `boltz_speed` — both run the same binary.
 
-**Option B — editable install from a local clone (recommended for development):**
-
-```bash
-# 1. Create a fresh conda environment (Python 3.10–3.12)
-conda create -n boltz_speed python=3.10 -y
-conda activate boltz_speed
-
-# 2. Install PyTorch with CUDA 12.1 (matches A100 on Minerva)
-#    Adjust cu121 → cu118 if your cluster runs CUDA 11.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# 3. Clone and install
-git clone https://github.com/indefatigable816/boltz_speedup.git
-cd boltz_speedup
-git checkout speedup/screening-mode
-pip install -e ".[cuda]"
-
-# 4. Verify
-python -c "import torch; print(torch.cuda.get_device_name(0))"
-boltz predict --help | grep screening
-```
-
-> **On Minerva (Mount Sinai HPC):**
-> ```bash
-> module load cuda/12.1
-> conda activate boltz_speed   # or your existing env
-> cd /sc/arion/work/cheny69/boltz_speedup
-> pip install -e ".[cuda]"
-> ```
-> `torch.compile` / Triton ships with PyTorch ≥ 2.2 on Linux — no separate install needed.
-
 ### Upstream boltz (original, no speedup)
 
 Install with PyPI:
