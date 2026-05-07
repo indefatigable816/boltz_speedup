@@ -1478,6 +1478,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = False
         steering_args.contact_guidance_update = False
         
+        # Do NOT override pairformer_args or msa_args here — the affinity
+        # checkpoint was trained with its own architecture (may differ from
+        # the conf model, e.g. 48-block V1 pairformer vs 64-block V2).
+        # Let PyTorch Lightning restore those from the checkpoint's saved hparams.
         model_module = Boltz2.load_from_checkpoint(
             affinity_checkpoint,
             strict=True,
@@ -1485,20 +1489,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
-            pairformer_args=asdict(pairformer_args),
-            msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
         )
         model_module.eval()
 
-        trainer.callbacks[0] = pred_writer
-        trainer.predict(
-            model_module,
-            datamodule=data_module,
-            return_predictions=False,
-        )
-
-
-if __name__ == "__main__":
-    cli()
+   
