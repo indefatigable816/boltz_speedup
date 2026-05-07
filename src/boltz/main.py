@@ -1514,9 +1514,21 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         # checkpoint was trained with its own architecture (may differ from
         # the conf model, e.g. 48-block V1 pairformer vs 64-block V2).
         # Let PyTorch Lightning restore those from the checkpoint's saved hparams.
+        #
+        # `strict=False` is intentional: boltz2_aff.ckpt pre-dates the upstream
+        # change that made `AttentionPairBias(initial_norm=True)` the default,
+        # so the live model has 384 conf-side
+        # `pairformer_module.layers.N.attention.norm_s.{weight,bias}` params
+        # that the on-disk affinity state_dict doesn't carry. Those params
+        # live on `Boltz2.pairformer_module`, which is constructed by
+        # __init__ but is **not** called during affinity inference —
+        # AffinityModule has its own PairformerNoSeqModule at
+        # `affinity_module.pairformer_stack`. Loading non-strict is safe for
+        # those keys; the post-load sanity check below ensures no critical
+        # `affinity_module*.*` weight is missing.
         model_module = Boltz2.load_from_checkpoint(
             affinity_checkpoint,
-            strict=True,
+            strict=False,
             predict_args=predict_affinity_args,
             map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
@@ -1524,6 +1536,31 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
         )
+
+        # Sanity check: confirm strict=False didn't hide a real architecture
+        # drift in the affinity head itself. Any missing param under
+        # `affinity_module*` means the ckpt and the live AffinityModule
+        # disagree, and we should fail loudly rather than predict with
+        # randomly-initialised weights.
+        _aff_ckpt = torch.load(
+            affinity_checkpoint, map_location="cpu", weights_only=False
+        )
+        _expected = set(model_module.state_dict().keys())
+        _present = set(_aff_ckpt.get("state_dict", {}).keys())
+        _critical_missing = sorted(
+            k for k in (_expected - _present)
+            if k.startswith(("affinity_module.",
+                             "affinity_module1.",
+                             "affinity_module2."))
+        )
+        del _aff_ckpt
+        if _critical_missing:
+            raise RuntimeError(
+                "Affinity checkpoint is missing core affinity-module "
+                f"weights ({len(_critical_missing)} keys). First 10:\n  "
+                + "\n  ".join(_critical_missing[:10])
+            )
+
         model_module.eval()
 
    
