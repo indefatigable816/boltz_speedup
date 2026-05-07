@@ -1242,7 +1242,51 @@ class Boltz1(LightningModule):
         if self.use_ema:
             checkpoint["ema"] = self.ema.state_dict()
 
+    def _normalize_compile_keys(
+        self, ckpt_sd: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        """Bridge `_orig_mod.` differences between checkpoint and model.
+
+        Symmetric to ``Boltz2._normalize_compile_keys``. See that docstring
+        for the full rationale.
+        """
+        model_keys = set(self.state_dict().keys())
+        if not ckpt_sd or model_keys.issuperset(ckpt_sd.keys()):
+            return ckpt_sd
+
+        new_sd: dict[str, Tensor] = {}
+        for key, value in ckpt_sd.items():
+            if key in model_keys:
+                new_sd[key] = value
+                continue
+
+            stripped = key.replace("._orig_mod.", ".")
+            if stripped != key and stripped in model_keys:
+                new_sd[stripped] = value
+                continue
+
+            parts = key.split(".")
+            inserted_match = None
+            for i in range(1, len(parts)):
+                cand = ".".join(parts[:i] + ["_orig_mod"] + parts[i:])
+                if cand in model_keys:
+                    inserted_match = cand
+                    break
+            if inserted_match is not None:
+                new_sd[inserted_match] = value
+                continue
+
+            new_sd[key] = value
+        return new_sd
+
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Defensive normalisation of `_orig_mod.` segments — see the matching
+        # method in Boltz2 for the full rationale.
+        if "state_dict" in checkpoint:
+            checkpoint["state_dict"] = self._normalize_compile_keys(
+                checkpoint["state_dict"]
+            )
+
         if self.use_ema and "ema" in checkpoint:
             self.ema = ExponentialMovingAverage(
                 parameters=self.parameters(), decay=self.ema_decay

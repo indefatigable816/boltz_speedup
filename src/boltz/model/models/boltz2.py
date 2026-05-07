@@ -1238,7 +1238,73 @@ class Boltz2(LightningModule):
 
         return optimizer
 
+    def _normalize_compile_keys(
+        self, ckpt_sd: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        """Bridge `_orig_mod.` prefix differences between checkpoint and model.
+
+        torch.compile() wraps a submodule in an ``OptimizedModule`` that
+        injects an extra ``_orig_mod.`` segment into every parameter name
+        returned by ``state_dict()``. A checkpoint saved from a compiled
+        model therefore stores keys *with* the segment, while a checkpoint
+        from an uncompiled model stores keys *without* it. Either side can
+        load into either side as long as we rename the keys to match the
+        live module hierarchy.
+
+        This method rewrites ``ckpt_sd`` so that every key matches a key in
+        ``self.state_dict()``, by inserting or stripping ``_orig_mod.``
+        anywhere along the path. Keys that cannot be matched are kept
+        as-is so that ``load_state_dict(strict=True)`` still surfaces real
+        mismatches downstream.
+        """
+        model_keys = set(self.state_dict().keys())
+        if not ckpt_sd or model_keys.issuperset(ckpt_sd.keys()):
+            return ckpt_sd
+
+        new_sd: dict[str, Tensor] = {}
+        for key, value in ckpt_sd.items():
+            if key in model_keys:
+                new_sd[key] = value
+                continue
+
+            # Try stripping every "_orig_mod." segment (ckpt was compiled,
+            # model is not).
+            stripped = key.replace("._orig_mod.", ".")
+            if stripped != key and stripped in model_keys:
+                new_sd[stripped] = value
+                continue
+
+            # Try inserting "_orig_mod." after each path segment (ckpt was
+            # uncompiled, model is compiled). Parameter names are unique so
+            # the first match is unambiguous.
+            parts = key.split(".")
+            inserted_match = None
+            for i in range(1, len(parts)):
+                cand = ".".join(parts[:i] + ["_orig_mod"] + parts[i:])
+                if cand in model_keys:
+                    inserted_match = cand
+                    break
+            if inserted_match is not None:
+                new_sd[inserted_match] = value
+                continue
+
+            # No match — leave the key untouched and let load_state_dict
+            # raise on it.
+            new_sd[key] = value
+        return new_sd
+
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Defensive: harmonise `_orig_mod.` between ckpt and live model so
+        # we are insulated from torch.compile() being applied to a different
+        # set of submodules at save vs. load time. The primary fix lives in
+        # boltz/main.py (compile_* are forced False in load_from_checkpoint),
+        # but this hook makes the loader resilient to any future caller that
+        # forgets that override.
+        if "state_dict" in checkpoint:
+            checkpoint["state_dict"] = self._normalize_compile_keys(
+                checkpoint["state_dict"]
+            )
+
         # Ignore the lr from the checkpoint
         lr = self.training_args.max_lr
         weight_decay = self.training_args.weight_decay

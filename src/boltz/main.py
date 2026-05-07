@@ -1397,6 +1397,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
+        # Force-disable torch.compile during __init__/load. Lightning's
+        # load_from_checkpoint replays the hparams that were saved by
+        # save_hyperparameters() at training time; if any compile_* flag is
+        # True at __init__, torch.compile() wraps the corresponding submodule
+        # and renames its parameters with an `_orig_mod.` prefix BEFORE
+        # load_state_dict runs, which then fails with a key mismatch against
+        # the (uncompiled) checkpoint state_dict. We override every compile_*
+        # to False here and apply torch.compile post-load below.
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
             strict=True,
@@ -1408,11 +1416,35 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
-            compile_pairformer=compile_pairformer,
-            compile_msa=compile_msa,
-            compile_structure=compile_structure,
-            compile_confidence=compile_confidence,
+            compile_pairformer=False,
+            compile_msa=False,
+            compile_structure=False,
+            compile_confidence=False,
+            compile_templates=False,
+            compile_affinity=False,
         )
+        # Apply torch.compile post-load — by now load_state_dict has succeeded,
+        # so wrapping submodules in OptimizedModule is safe.
+        if compile_msa:
+            model_module.is_msa_compiled = True
+            model_module.msa_module = torch.compile(
+                model_module.msa_module, dynamic=False, fullgraph=False
+            )
+        if compile_pairformer:
+            model_module.is_pairformer_compiled = True
+            model_module.pairformer_module = torch.compile(
+                model_module.pairformer_module, dynamic=False, fullgraph=False
+            )
+        if compile_structure:
+            model_module.structure_module.score_model = torch.compile(
+                model_module.structure_module.score_model,
+                dynamic=False,
+                fullgraph=False,
+            )
+        if compile_confidence and hasattr(model_module, "confidence_module"):
+            model_module.confidence_module = torch.compile(
+                model_module.confidence_module, dynamic=False, fullgraph=False
+            )
         model_module.eval()
 
         # Compute structure predictions
