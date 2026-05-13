@@ -1563,4 +1563,19 @@ def predict(  # noqa: C901, PLR0915, PLR0912
 
         model_module.eval()
 
-   
+        # Run affinity prediction. Replace callbacks[0] (the structure
+        # BoltzWriter from the first trainer init) with the BoltzAffinityWriter
+        # so write_on_batch_end / on_predict_epoch_end fire for the affinity
+        # batch. This block was accidentally deleted in commit f46f0b6
+        # (the OneDrive/virtiofs sync bug truncated the file at save time)
+        # and silently restored on 2026-05-11.
+        trainer.callbacks[0] = pred_writer
+        trainer.predict(
+            model_module,
+            datamodule=data_module,
+            return_predictions=False,
+        )
+
+
+if __name__ == "__main__":
+    cli()
